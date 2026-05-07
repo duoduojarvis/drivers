@@ -9,6 +9,7 @@
 #include <linux/miscdevice.h>
 #include <linux/of.h>
 #include <linux/of_gpio.h>
+#include <linux/uaccess.h> 
 #include "miscbeep.h"
 
 struct miscbeep_dev dev;

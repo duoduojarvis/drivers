@@ -11,6 +11,7 @@
 #include <linux/of_gpio.h>
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
+#include <linux/uaccess.h>
 #include "key.h"
 
 struct key_dev key_dev;
@@ -163,17 +164,17 @@ static struct platform_driver key_drv = {
 	}
 };
 
-static int __init key_init(void)
+static int __init mykey_init(void)
 {
 	return platform_driver_register(&key_drv);
 }
 
-static void __exit key_exit(void)
+static void __exit mykey_exit(void)
 {
 	platform_driver_unregister(&key_drv);
 }
 
-module_init(key_init);
-module_exit(key_exit);
+module_init(mykey_init);
+module_exit(mykey_exit);
 MODULE_LICENSE("GPL");
 
