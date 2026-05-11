@@ -1,0 +1,14 @@
+# 内核模块编译产物
+*.o
+*.ko
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+.*.cmd
+.*.d
+.tmp_versions/
+
+# clangd 缓存
+.cache/
+compile_commands.json

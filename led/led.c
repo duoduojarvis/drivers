@@ -1,291 +1,277 @@
-#include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/delay.h>
-#include <linux/ide.h>
-#include <linux/errno.h>
-#include <linux/gpio.h>
-#include <linux/cdev.h>
-#include <linux/device.h>
+#include <linux/platform_device.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <asm/mach/map.h>
-#include <asm/uaccess.h>
-#include <asm/io.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
 #include <linux/timer.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/io.h>
+#include <linux/spinlock.h>
 #include "led.h"
 
-#define CLOSE_TIMER_CMD (_IO(0XEF, 0x1)) /* 关闭定时器 */
-#define OPEN_TIMER_CMD (_IO(0XEF, 0x2)) /* 打开定时器 */
-#define SET_TIME_PERIOD_CMD (_IO(0XEF, 0x3)) /* 设置定时器周期命令 */
+#define LED_CLOSE_TIMER  _IO(0XEF, 0x1) /* 关闭定时器 */
+#define LED_OPEN_TIMER   _IO(0XEF, 0x2) /* 打开定时器 */
+#define LED_SET_PERIOD   _IO(0XEF, 0x3) /* 设置定时器周期 */
 
-static void __iomem *CCM_CCGR1;
-static void __iomem *SW_MUX_GPIO1_IO03;
-static void __iomem *SW_PAD_GPIO1_IO03;
-static void __iomem *GPIO1_DR;
-static void __iomem *GPIO1_GDIR;
+#define LED_DEFAULT_PERIOD  1000 /* 默认闪烁周期 1000ms */
 
-static struct led_desc desc;
+/* ------------------------------------------------------------------ */
+/* 硬件操作                                                             */
+/* ------------------------------------------------------------------ */
 
-void led_on(void)
+static void led_hw_on(struct led_dev *dev)
 {
-	unsigned int val;
-	val = readl(GPIO1_DR);
-	pr_info("<%s> old: val=0x%x\n", __func__, val);
-	val &= ~(1 << 3);
-	writel(val, GPIO1_DR);
-
-	val = readl(GPIO1_DR);
-	pr_info("<%s> new: val=0x%x\n", __func__, val);
+	u32 val = readl(dev->gpio_dr);
+	val &= ~BIT(3);
+	writel(val, dev->gpio_dr);
 }
-EXPORT_SYMBOL(led_on);
 
-void led_off(void)
+static void led_hw_off(struct led_dev *dev)
 {
-	unsigned int val;
-	val = readl(GPIO1_DR);
-	pr_info("<%s> old: val=0x%x\n", __func__, val);
-	val |= (1 << 3);
-	writel(val, GPIO1_DR);
-
-	val = readl(GPIO1_DR);
-	pr_info("<%s> new: val=0x%x\n", __func__, val);
+	u32 val = readl(dev->gpio_dr);
+	val |= BIT(3);
+	writel(val, dev->gpio_dr);
 }
-EXPORT_SYMBOL(led_off);
 
-static void set_led_status(unsigned char status)
+static void led_set_status(struct led_dev *dev, int on)
 {
-	if (status == 0)
-		led_off();
+	if (on)
+		led_hw_on(dev);
 	else
-		led_on();
+		led_hw_off(dev);
 }
 
-static void restart_timer(void)
+static void led_hw_init(struct led_dev *dev)
 {
-	unsigned long flags = 0;
-	int timerperiod;
+	u32 val;
 
-	spin_lock_irqsave(&desc.lock, flags);
-	timerperiod = desc.timeperiod;
-	spin_unlock_irqrestore(&desc.lock, flags);
-	/* 重启定时器 */
-	(void)mod_timer(&desc.timer, jiffies + msecs_to_jiffies(timerperiod));
+	/* 使能 GPIO1 时钟：CCM_CCGR1[27:26] = 11 */
+	val = readl(dev->ccm_ccgr1);
+	val |= (0x3 << 26);
+	writel(val, dev->ccm_ccgr1);
+
+	/* 设置 GPIO1_IO03 复用为 GPIO 功能 */
+	writel(0x5, dev->sw_mux);
+
+	/* 设置 PAD 属性（100MHz，Hysteresis Enabled） */
+	writel(0x10B0, dev->sw_pad);
+
+	/* 设置 GPIO1_IO03 为输出方向 */
+	val = readl(dev->gpio_gdir);
+	val |= BIT(3);
+	writel(val, dev->gpio_gdir);
+
+	/* 默认关闭 LED（高电平） */
+	val = readl(dev->gpio_dr);
+	val |= BIT(3);
+	writel(val, dev->gpio_dr);
 }
 
-static void set_time_period(unsigned long arg)
-{
-	unsigned long flags = 0;
+/* ------------------------------------------------------------------ */
+/* 定时器                                                               */
+/* ------------------------------------------------------------------ */
 
-	spin_lock_irqsave(&desc.lock, flags);
-	desc.timeperiod = arg;
-	spin_unlock_irqrestore(&desc.lock, flags);
+static void led_timer_restart(struct led_dev *dev)
+{
+	unsigned long flags;
+	int period;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	period = dev->timeperiod;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	mod_timer(&dev->timer, jiffies + msecs_to_jiffies(period));
 }
 
-void timer_function(unsigned long arg)
+static void led_timer_cb(unsigned long arg)
 {
-	struct led_desc *desc = (struct led_desc *)arg;
+	struct led_dev *dev = (struct led_dev *)arg;
 
-	desc->status = !desc->status;
-	set_led_status(desc->status);
-	restart_timer();
+	dev->status = !dev->status;
+	led_set_status(dev, dev->status);
+	led_timer_restart(dev);
 }
 
-static void init_led_timer(void)
-{
-	spin_lock_init(&desc.lock);
-	init_timer(&desc.timer);
-	desc.timer.function = timer_function;
-	desc.timer.data = (unsigned long)&desc;
-	desc.timeperiod = 1000;
-}
+/* ------------------------------------------------------------------ */
+/* 字符设备文件操作                                                      */
+/* ------------------------------------------------------------------ */
 
-static long timer_unlocked_ioctl(struct file* flip, unsigned int cmd, unsigned long arg)
+static int led_open(struct inode *inode, struct file *filp)
 {
-	struct led_desc *desc = (struct led_desc *)flip->private_data;
-	pr_info("[zrc] cmd=0x%x\n", cmd);
+	struct led_dev *dev = container_of(inode->i_cdev, struct led_dev, cdev);
 
-	switch (cmd) {
-	case CLOSE_TIMER_CMD:
-		del_timer_sync(&desc->timer);
-		break;
-	case OPEN_TIMER_CMD:
-		restart_timer();
-		break;
-	case SET_TIME_PERIOD_CMD:
-		set_time_period(arg);
-		break;
-	default:
-		break;
-	}
-	return 0;
-}
-
-static ssize_t led_open(struct inode *inode, struct file *filp)
-{
-	filp->private_data = &desc;
+	filp->private_data = dev;
 	return 0;
 }
 
 static ssize_t led_write(struct file *filp, const char __user *buf,
-	int cnt, loff_t *offt)
+			 size_t cnt, loff_t *offt)
 {
-	unsigned long ret;
-	unsigned char onoff;
+	struct led_dev *dev = filp->private_data;
+	unsigned char val;
 
-	ret = copy_from_user(&onoff, buf, cnt);
-	if (ret < 0) {
-		pr_err("write led failed\n");
+	if (copy_from_user(&val, buf, 1))
 		return -EFAULT;
-	}
 
-	if (onoff == 1)
-		led_on();
-	else if (onoff == 0)
-		led_off();
-	else
-		pr_info("please input 1 to turn on led, 0 to turn off led\n");
-
+	led_set_status(dev, val);
 	return cnt;
 }
 
-static void led_reg_init(struct device_node *np)
+static long led_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	unsigned int val;
+	struct led_dev *dev = filp->private_data;
+	unsigned long flags;
 
-	// 初始化LED
-	// 映射寄存器
-	CCM_CCGR1 = of_iomap(np, 4);
-	SW_MUX_GPIO1_IO03 = of_iomap(np, 0);
-	SW_PAD_GPIO1_IO03 = of_iomap(np, 3);
-	GPIO1_DR = of_iomap(np, 1);
-	GPIO1_GDIR = of_iomap(np, 2);
-
-	// 使能GPIO01时钟 [27:26] 设置成11 时钟在所有模式下都处于打开状态，但停止模式除外。
-	val = readl(CCM_CCGR1);
-	val &= ~(0x3 << 26);
-	val |= (0x3 << 26);
-	writel(val, CCM_CCGR1);
-
-	// 设置复用
-	writel(0x5, SW_MUX_GPIO1_IO03);
-
-	// 设置PAD 1 0000 1011 0000 (100MHZ  Hysteresis Enabled)
-	writel(0x10B0, SW_PAD_GPIO1_IO03);
-
-	// 设置为输出 第三位表示GPIO3
-	val = readl(GPIO1_GDIR);
-	val &= ~(1 << 3);
-	val |= (1 << 3);
-	writel(val, GPIO1_GDIR);
-
-	// 设置为高电平, 关闭
-	val = readl(GPIO1_DR);
-	val &= ~(1 << 3);
-	val |= (1 << 3);
-	writel(val, GPIO1_DR);
+	switch (cmd) {
+	case LED_CLOSE_TIMER:
+		del_timer_sync(&dev->timer);
+		break;
+	case LED_OPEN_TIMER:
+		led_timer_restart(dev);
+		break;
+	case LED_SET_PERIOD:
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->timeperiod = (int)arg;
+		spin_unlock_irqrestore(&dev->lock, flags);
+		break;
+	default:
+		return -ENOTTY;
+	}
+	return 0;
 }
 
-static struct file_operations led_fops = {
-	.owner = THIS_MODULE,
-	.open = led_open,
-	.write = led_write,
-	.unlocked_ioctl = timer_unlocked_ioctl,
+static const struct file_operations led_fops = {
+	.owner          = THIS_MODULE,
+	.open           = led_open,
+	.write          = led_write,
+	.unlocked_ioctl = led_ioctl,
 };
 
-static int __init led_init(void)
+/* ------------------------------------------------------------------ */
+/* platform driver probe / remove                                       */
+/* ------------------------------------------------------------------ */
+
+static int led_probe(struct platform_device *pdev)
 {
-	struct device_node *np;
-	struct property *proper;
+	struct device_node *np = pdev->dev.of_node;
+	struct led_dev *dev;
 	int ret;
-	struct led_desc *pdesc = &desc;
 
-	// 获取led设备节点
-	np = of_find_node_by_path("/led");
-	if (!np) {
-		pr_err("No sysrq node found\n");
-		return -1;
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	/* 映射寄存器（索引与 DTS reg 属性顺序一致） */
+	dev->sw_mux    = of_iomap(np, 0);
+	dev->gpio_dr   = of_iomap(np, 1);
+	dev->gpio_gdir = of_iomap(np, 2);
+	dev->sw_pad    = of_iomap(np, 3);
+	dev->ccm_ccgr1 = of_iomap(np, 4);
+
+	if (!dev->sw_mux || !dev->gpio_dr || !dev->gpio_gdir ||
+	    !dev->sw_pad || !dev->ccm_ccgr1) {
+		dev_err(&pdev->dev, "of_iomap failed\n");
+		ret = -ENOMEM;
+		goto err_iomap;
 	}
 
-	// 获取compatible属性
-	proper = of_find_property(np, "compatible", NULL);
-	if (!proper) {
-		pr_err("find led's compatible failed\n");
+	led_hw_init(dev);
+
+	/* 申请设备号 */
+	ret = alloc_chrdev_region(&dev->dev_id, 0, 1, "led");
+	if (ret) {
+		dev_err(&pdev->dev, "alloc_chrdev_region failed\n");
+		goto err_iomap;
 	}
 
-	led_reg_init(np);
-
-	// 注册字符设备驱动
-	ret = alloc_chrdev_region(&pdesc->dev_id, 0, 1, "led");
-	if (ret != 0) {
-		pr_err("alloc_chrdev_region failed\n");
-		kfree(pdesc);
-		return -1;
+	/* 初始化并注册 cdev */
+	cdev_init(&dev->cdev, &led_fops);
+	ret = cdev_add(&dev->cdev, dev->dev_id, 1);
+	if (ret) {
+		dev_err(&pdev->dev, "cdev_add failed\n");
+		goto err_chrdev;
 	}
 
-	pdesc->major = MAJOR(pdesc->dev_id);
-	pdesc->minor = MINOR(pdesc->dev_id);
-	pr_info("devid=0x%x, major=%d, minor=%d\n", pdesc->dev_id, pdesc->major, pdesc->minor);
-
-	// 初始化cdev
-	(void)cdev_init(&pdesc->cdev, &led_fops);
-
-	// 添加cdev
-	ret = cdev_add(&pdesc->cdev, pdesc->dev_id, 1);
-	if (ret != 0) {
-		pr_err("cdev_add failed\n");
-		goto out;
+	/* 创建 class 和 device，自动生成 /dev/led */
+	dev->class = class_create(THIS_MODULE, "led");
+	if (IS_ERR(dev->class)) {
+		ret = PTR_ERR(dev->class);
+		dev_err(&pdev->dev, "class_create failed\n");
+		goto err_cdev;
 	}
 
-	//创建类
-	pdesc->class = class_create(THIS_MODULE, "led");
-	if (IS_ERR(pdesc->class)) {
-		pr_err("create class: led failed\n");
-		goto out1;
+	dev->device = device_create(dev->class, &pdev->dev,
+				    dev->dev_id, NULL, "led");
+	if (IS_ERR(dev->device)) {
+		ret = PTR_ERR(dev->device);
+		dev_err(&pdev->dev, "device_create failed\n");
+		goto err_class;
 	}
 
-	pdesc->device = device_create(pdesc->class, NULL, pdesc->dev_id, NULL, "led");
-	if (IS_ERR(pdesc->device)) {
-		pr_err("create device led failed\n");
-		goto out2;
-	}
+	/* 初始化定时器 */
+	spin_lock_init(&dev->lock);
+	init_timer(&dev->timer);
+	dev->timer.function = led_timer_cb;
+	dev->timer.data     = (unsigned long)dev;
+	dev->timeperiod     = LED_DEFAULT_PERIOD;
 
-	init_led_timer();
-	pr_info("probe led success\n");
+	platform_set_drvdata(pdev, dev);
+	dev_info(&pdev->dev, "LED driver probed\n");
 	return 0;
 
-out2:
-	class_destroy(pdesc->class);
-	kfree(pdesc);
-out1:
-	cdev_del(&pdesc->cdev);
-	kfree(pdesc);
-out:
-	unregister_chrdev_region(pdesc->dev_id, 1);
-	kfree(pdesc);
+err_class:
+	class_destroy(dev->class);
+err_cdev:
+	cdev_del(&dev->cdev);
+err_chrdev:
+	unregister_chrdev_region(dev->dev_id, 1);
+err_iomap:
+	if (dev->sw_mux)    iounmap(dev->sw_mux);
+	if (dev->gpio_dr)   iounmap(dev->gpio_dr);
+	if (dev->gpio_gdir) iounmap(dev->gpio_gdir);
+	if (dev->sw_pad)    iounmap(dev->sw_pad);
+	if (dev->ccm_ccgr1) iounmap(dev->ccm_ccgr1);
 	return ret;
-	
 }
 
-static void __exit led_exit(void)
+static int led_remove(struct platform_device *pdev)
 {
-	struct led_desc *pdesc = &desc;
-	// 取消映射
-	iounmap(CCM_CCGR1);
-	iounmap(SW_MUX_GPIO1_IO03);
-	iounmap(SW_PAD_GPIO1_IO03);
-	iounmap(GPIO1_DR);
-	iounmap(GPIO1_GDIR);
+	struct led_dev *dev = platform_get_drvdata(pdev);
 
-	/* 注销字符设备驱动 */
-	cdev_del(&pdesc->cdev);/* 删除 cdev */
-	unregister_chrdev_region(pdesc->dev_id, 1);/*注销设备号*/
-	device_destroy(pdesc->class, pdesc->dev_id);
-	class_destroy(pdesc->class);
+	del_timer_sync(&dev->timer);
+	device_destroy(dev->class, dev->dev_id);
+	class_destroy(dev->class);
+	cdev_del(&dev->cdev);
+	unregister_chrdev_region(dev->dev_id, 1);
+	iounmap(dev->sw_mux);
+	iounmap(dev->gpio_dr);
+	iounmap(dev->gpio_gdir);
+	iounmap(dev->sw_pad);
+	iounmap(dev->ccm_ccgr1);
+
+	dev_info(&pdev->dev, "LED driver removed\n");
+	return 0;
 }
 
-module_init(led_init);
-module_exit(led_exit);
-MODULE_LICENSE("GPL");
+static const struct of_device_id led_of_match[] = {
+	{ .compatible = "alientek,led" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, led_of_match);
 
+static struct platform_driver led_driver = {
+	.probe  = led_probe,
+	.remove = led_remove,
+	.driver = {
+		.name           = "alientek-led",
+		.of_match_table = led_of_match,
+	},
+};
+module_platform_driver(led_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("zrc");
+MODULE_DESCRIPTION("iMX6ULL LED platform driver");

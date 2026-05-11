@@ -1,21 +1,26 @@
 #ifndef __LED_H
 #define __LED_H
 
-struct led_desc {
-	dev_t dev_id;
-	struct cdev cdev;
-	struct class *class;
+#include <linux/cdev.h>
+#include <linux/timer.h>
+#include <linux/spinlock.h>
+
+struct led_dev {
+	void __iomem *ccm_ccgr1;
+	void __iomem *sw_mux;
+	void __iomem *sw_pad;
+	void __iomem *gpio_dr;
+	void __iomem *gpio_gdir;
+
+	dev_t          dev_id;
+	struct cdev    cdev;
+	struct class  *class;
 	struct device *device;
-	int major;
-	int minor;
-	struct device_node *np;
-	int timeperiod; // ¶¨Ê±Æ÷ÖÜÆÚ,µ¥Î»MS
-	struct timer_list timer; // ¶¨Ê±Æ÷½á¹¹Ìå
-	spinlock_t lock;
-	unsigned char status; // 0:¹Ø±ÕLED
+
+	struct timer_list timer;
+	spinlock_t        lock;
+	int               timeperiod; /* å®šæ—¶å™¨å‘¨æœŸï¼Œå•ä½ ms */
+	unsigned char     status;     /* 0: LED å…³é—­ï¼Œ1: LED æ‰“å¼€ */
 };
 
-void led_off(void);
-void led_on(void);
-
-#endif
+#endif /* __LED_H */

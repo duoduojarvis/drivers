@@ -1,6 +1,6 @@
 CURRENT_DIR := $(shell pwd)
 
-KERNEL_DIR := $(CURRENT_DIR)/../../kernel
+KERNEL_DIR := $(CURRENT_DIR)/../../kernel4.14
 obj-m := led.o
 
 build: kernel_modules

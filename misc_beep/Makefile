@@ -1,6 +1,6 @@
 CURRENT_DIR := $(shell pwd)
 
-KERNEL_DIR := $(CURRENT_DIR)/../..
+KERNEL_DIR := $(CURRENT_DIR)/../../kernel4.14
 obj-m := miscbeep.o
 
 build: kernel_modules

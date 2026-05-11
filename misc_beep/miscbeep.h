@@ -1,13 +1,12 @@
 #ifndef __MISCBEEP_H
 #define __MISCBEEP_H
 
-struct miscbeep_dev {
-	dev_t dev_id;
-	struct cdev cdev;
-	struct class *class;
-	struct device *device;
-	struct device_node *np;
-	int gpio;
+#include <linux/miscdevice.h>
+#include <linux/gpio/consumer.h>
+
+struct beep_dev {
+	struct gpio_desc  *gpiod;     /* GPIO 描述符，devm_ 自动释放 */
+	struct miscdevice  miscdev;   /* misc 设备，自动创建 /dev/beep */
 };
 
-#endif
+#endif /* __MISCBEEP_H */

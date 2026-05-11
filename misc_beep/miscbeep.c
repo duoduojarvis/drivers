@@ -1,124 +1,120 @@
-#include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/module.h>
-#include <linux/cdev.h>
-#include <linux/fs.h>
 #include <linux/platform_device.h>
-#include <asm/uaccess.h>
-#include <linux/gpio.h>
-#include <linux/miscdevice.h>
-#include <linux/of.h>
-#include <linux/of_gpio.h>
-#include <linux/uaccess.h> 
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/slab.h>
 #include "miscbeep.h"
 
-struct miscbeep_dev dev;
+/* ------------------------------------------------------------------ */
+/* 文件操作                                                             */
+/* ------------------------------------------------------------------ */
 
-static int beep_open(struct inode *inode, struct file *flip)
+static int beep_open(struct inode *inode, struct file *filp)
 {
-	flip->private_data = &dev;
+	/*
+	 * misc 框架在 open 时将 filp->private_data 设置为 miscdevice 指针，
+	 * 通过 container_of 反推出外层 beep_dev 结构体。
+	 */
+	struct miscdevice *miscdev = filp->private_data;
+	struct beep_dev *dev = container_of(miscdev, struct beep_dev, miscdev);
+
+	filp->private_data = dev;
 	return 0;
 }
 
-static ssize_t beep_write(struct file *flip, const char __user *buf, size_t size, loff_t *offset)
+static ssize_t beep_write(struct file *filp, const char __user *buf,
+			  size_t size, loff_t *offset)
 {
-	char onoff;
-	int err;
+	struct beep_dev *dev = filp->private_data;
+	unsigned char onoff;
 
-	err = copy_from_user(&onoff, buf, sizeof(onoff));
-	if (err < 0) {
+	if (copy_from_user(&onoff, buf, 1))
 		return -EFAULT;
-	}
 
-	if (onoff == 1)
-		gpio_set_value(dev.gpio, 0);
-	else if (onoff == 0)
-		gpio_set_value(dev.gpio, 1);
+	/*
+	 * gpiod_set_value 使用逻辑电平：
+	 *   1 = 逻辑高 = 有效（蜂鸣器响，DTS 中已声明 GPIO_ACTIVE_LOW）
+	 *   0 = 逻辑低 = 无效（蜂鸣器停）
+	 */
+	if (onoff)
+		gpiod_set_value(dev->gpiod, 1);
 	else
-		pr_err("please input 1 to turn on beep, or 0 to turn off beep\n");
+		gpiod_set_value(dev->gpiod, 0);
 
-	return 0;
+	return size;
 }
 
-static struct file_operations beep_fops = {
+static const struct file_operations beep_fops = {
 	.owner = THIS_MODULE,
-	.open = beep_open,
+	.open  = beep_open,
 	.write = beep_write,
 };
 
-static struct miscdevice beep_miscdev = {
-	.minor		= 144,
-	.name		= "beep",
-	.fops		= &beep_fops,
-};
+/* ------------------------------------------------------------------ */
+/* platform driver probe / remove                                       */
+/* ------------------------------------------------------------------ */
 
 static int beep_probe(struct platform_device *pdev)
 {
-	int err;
+	struct beep_dev *dev;
+	int ret;
 
-	dev.np = of_find_node_by_path("/beep");
-	if (!dev.np) {
-		pr_err("can't find beep in dts\n");
-		return -EINVAL;
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	/*
+	 * 从 DTS 获取 GPIO 描述符。
+	 * "beep" 对应 DTS 属性 "beep-gpio"，GPIOD_OUT_LOW 表示初始
+	 * 逻辑低（蜂鸣器关闭）。devm_ 版本在设备卸载时自动释放。
+	 */
+	dev->gpiod = devm_gpiod_get(&pdev->dev, "beep", GPIOD_OUT_LOW);
+	if (IS_ERR(dev->gpiod)) {
+		dev_err(&pdev->dev, "Failed to get beep gpio\n");
+		return PTR_ERR(dev->gpiod);
 	}
 
-	dev.gpio = of_get_named_gpio(dev.np, "beep-gpio",0);
-	if (!gpio_is_valid(dev.gpio)) {
-		return -ENODEV;
+	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+	dev->miscdev.name  = "beep";
+	dev->miscdev.fops  = &beep_fops;
+
+	ret = misc_register(&dev->miscdev);
+	if (ret) {
+		dev_err(&pdev->dev, "misc_register failed\n");
+		return ret;
 	}
 
-	// 设置为输出并且关闭蜂鸣器
-	err = gpio_direction_output(dev.gpio, 1);
-	if (err < 0) {
-		pr_err("set gpio direction fali\n");
-		return -EINVAL;
-	}
-
-	err = misc_register(&beep_miscdev);
-	if (err < 0) {
-		pr_err("BEEP error: cannot register device");
-		return err;
-	}
-
+	platform_set_drvdata(pdev, dev);
+	dev_info(&pdev->dev, "beep driver probed\n");
 	return 0;
 }
 
 static int beep_remove(struct platform_device *pdev)
 {
+	struct beep_dev *dev = platform_get_drvdata(pdev);
 
-	// 关闭蜂鸣器
-	gpio_set_value(dev.gpio, 1);
-
-	// 注销misc设备驱动
-	(void)misc_deregister(&beep_miscdev);
+	gpiod_set_value(dev->gpiod, 0); /* 卸载前确保蜂鸣器关闭 */
+	misc_deregister(&dev->miscdev);
+	dev_info(&pdev->dev, "beep driver removed\n");
 	return 0;
 }
 
-static const struct of_device_id beep_of_match_table[] = {
-	{ .compatible = "beep" },
-	{},
+static const struct of_device_id beep_of_match[] = {
+	{ .compatible = "alientek,beep" },
+	{ }
 };
+MODULE_DEVICE_TABLE(of, beep_of_match);
 
-static struct platform_driver beep_drv = {
-	.probe = beep_probe,
+static struct platform_driver beep_driver = {
+	.probe  = beep_probe,
 	.remove = beep_remove,
 	.driver = {
-		.owner = THIS_MODULE,
-		.name = "beep",
-		.of_match_table = beep_of_match_table,
-	}
+		.name           = "alientek-beep",
+		.of_match_table = beep_of_match,
+	},
 };
+module_platform_driver(beep_driver);
 
-static int __init beep_init(void)
-{
-	return platform_driver_register(&beep_drv);
-}
-
-static void __exit beep_exit(void)
-{
-	platform_driver_unregister(&beep_drv);
-}
-
-module_init(beep_init);
-module_exit(beep_exit);
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("zrc");
+MODULE_DESCRIPTION("iMX6ULL beep driver (miscdevice)");
