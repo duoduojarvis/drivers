@@ -1,27 +1,18 @@
 #ifndef __KEY_H
 #define __KEY_H
 
-struct key_irq {
-	char name[10];
-	unsigned int irqnum;
-	irqreturn_t (*handler)(int, void *);
-};
+#include <linux/gpio/consumer.h>
+#include <linux/miscdevice.h>
+#include <linux/timer.h>
+#include <linux/spinlock.h>
 
 struct key_dev {
-	dev_t dev_id;
-	struct cdev cdev;
-	struct class *class;
-	struct device *device;
-	struct device_node *np;
-	int gpio;
-	int timeperiod;
-	struct timer_list timer;
-	spinlock_t lock;
-	unsigned char value;
-	struct key_irq irq;
+	struct gpio_desc  *gpiod;    /* GPIO 描述符，devm_ 自动释放 */
+	struct miscdevice  miscdev;  /* misc 设备，自动创建 /dev/key */
+	struct timer_list  timer;    /* 消抖定时器 */
+	spinlock_t         lock;
+	unsigned int       irqnum;
+	unsigned char      key_val;  /* 消抖后的键值：1=按下 0=松开 */
 };
 
-extern void led_on(void);
-extern void led_off(void);
-
-#endif
+#endif /* __KEY_H */

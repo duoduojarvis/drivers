@@ -1,180 +1,182 @@
+/*
+ * iMX6ULL 按键 platform 驱动（miscdevice + gpiod + 中断消抖）
+ *
+ * 硬件：GPIO1_IO18，低电平触发（GPIO_ACTIVE_LOW）
+ * 设备节点：/dev/key
+ * 读取键值：1 = 按下，0 = 松开
+ */
+
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/platform_device.h>
-#include <asm/uaccess.h>
-#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/miscdevice.h>
-#include <linux/of.h>
-#include <linux/of_gpio.h>
 #include <linux/interrupt.h>
-#include <linux/of_irq.h>
+#include <linux/of.h>
 #include <linux/uaccess.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/timer.h>
 #include "key.h"
 
-struct key_dev key_dev;
+#define KEY_DEBOUNCE_MS  10   /* 消抖延迟，毫秒 */
 
-static int key_open(struct inode *nd, struct file *flip)
+/* ---------- file_operations ---------- */
+
+static int key_open(struct inode *inode, struct file *filp)
 {
-	flip->private_data = &key_dev;
+	/*
+	 * misc 框架 open 时将 filp->private_data 设为 miscdevice 指针，
+	 * 用 container_of 反推外层 key_dev。
+	 */
+	struct miscdevice *miscdev = filp->private_data;
+	struct key_dev *dev = container_of(miscdev, struct key_dev, miscdev);
+
+	filp->private_data = dev;
 	return 0;
 }
 
-static ssize_t key_read(struct file *flip, char __user *buf, size_t size, loff_t *offset)
+static ssize_t key_read(struct file *filp, char __user *buf,
+			size_t size, loff_t *offset)
 {
-	int isPress;
-	int ret;
+	struct key_dev *dev = filp->private_data;
+	unsigned char val;
+	unsigned long flags;
 
-	isPress = gpio_get_value(key_dev.gpio);
-	pr_info("[kernel] isPress=%d\n", isPress);
-	ret = copy_to_user(buf, &isPress, sizeof(isPress));
+	if (size < 1)
+		return 0;
 
-	return ret;
+	spin_lock_irqsave(&dev->lock, flags);
+	val = dev->key_val;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (copy_to_user(buf, &val, 1))
+		return -EFAULT;
+
+	return 1;
 }
 
-//定时器服务函数
-static void timer_function(unsigned long arg)
+static const struct file_operations key_fops = {
+	.owner  = THIS_MODULE,
+	.open   = key_open,
+	.read   = key_read,
+};
+
+/* ---------- 中断消抖 ---------- */
+
+/*
+ * 消抖定时器服务函数：定时器到期后读取 GPIO 确认键值。
+ * gpiod_get_value 返回逻辑值：GPIO_ACTIVE_LOW 下，
+ * 物理低电平（按下）→ 逻辑 1；物理高电平（松开）→ 逻辑 0。
+ */
+static void key_timer_func(unsigned long arg)
 {
-	int key_value;
 	struct key_dev *dev = (struct key_dev *)arg;
+	unsigned long flags;
+	int val;
 
-	key_value = gpio_get_value(dev->gpio);
-	pr_info("key_value=0x%x\r\n", key_value);
-	if (key_value == 0)
-		led_on();
-	else
-		led_off();
+	val = gpiod_get_value(dev->gpiod);  /* 逻辑值：1=按下 0=松开 */
+
+	spin_lock_irqsave(&dev->lock, flags);
+	dev->key_val = (unsigned char)val;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	pr_debug("[key] debounced: key_val=%d\n", val);
 }
 
-static void init_key_timer(void)
-{
-	spin_lock_init(&key_dev.lock);
-	init_timer(&key_dev.timer);
-	key_dev.timer.function = timer_function;
-	key_dev.timer.data = (unsigned long)&key_dev;
-	key_dev.timeperiod = 5; // 毫秒
-}
-
+/* 中断处理：任意边沿触发，重启消抖定时器 */
 static irqreturn_t key_irq_handler(int irq, void *data)
 {
-	struct key_dev *dev = (struct key_dev *)data;
+	struct key_dev *dev = data;
 
-	dev->timer.data = (volatile long)data;
-	// 启动定时器
-	(void)mod_timer(&dev->timer, jiffies + msecs_to_jiffies(dev->timeperiod));
-	return IRQ_RETVAL(IRQ_HANDLED);
+	mod_timer(&dev->timer, jiffies + msecs_to_jiffies(KEY_DEBOUNCE_MS));
+	return IRQ_HANDLED;
 }
 
-static int key_dev_init(struct key_dev *key_dev)
+/* ---------- platform driver ---------- */
+
+static int key_probe(struct platform_device *pdev)
 {
-	key_dev->np = of_find_node_by_path("/key");
+	struct key_dev *dev;
+	int irq, err;
 
-	if (!key_dev->np) {
-		pr_err("can't find key in dts\n");
-		return -EINVAL;
+	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	/* 申请 GPIO，方向输入，DTS 中 "key-gpio" 属性 */
+	dev->gpiod = devm_gpiod_get(&pdev->dev, "key", GPIOD_IN);
+	if (IS_ERR(dev->gpiod)) {
+		dev_err(&pdev->dev, "failed to get key gpio: %ld\n",
+			PTR_ERR(dev->gpiod));
+		return PTR_ERR(dev->gpiod);
 	}
 
-	key_dev->gpio = of_get_named_gpio(key_dev->np, "key-gpio", 0);
-	if (!gpio_is_valid(key_dev->gpio))
-		return -ENODEV;
-
-	key_dev->irq.handler = key_irq_handler;
-	sprintf(key_dev->irq.name, "KEY%d", 0);
-	return 0;
-}
-
-static int key_irq_init(struct key_dev *key_dev)
-{
-	int err;
-	struct key_irq *irq = &key_dev->irq;
-
-	irq->irqnum =  gpio_to_irq(key_dev->gpio);
-	pr_info("irqnum=%u\n", irq->irqnum);
-
-	err = request_irq(irq->irqnum, irq->handler, IRQF_TRIGGER_FALLING, irq->name, key_dev);
-	if (err < 0) {
-		pr_err("request irq fail\n");
-		return err;
+	/* 获取中断号 */
+	irq = gpiod_to_irq(dev->gpiod);
+	if (irq < 0) {
+		dev_err(&pdev->dev, "failed to get irq from gpio\n");
+		return irq;
 	}
-	return 0;
-}
+	dev->irqnum = irq;
 
+	/* 初始化自旋锁和消抖定时器 */
+	spin_lock_init(&dev->lock);
+	setup_timer(&dev->timer, key_timer_func, (unsigned long)dev);
 
-static struct file_operations key_fops= {
-	.owner = THIS_MODULE,
-	.open = key_open,
-	.read = key_read,
-};
-
-struct miscdevice key_miscdev = {
-	.minor		= 143,
-	.name		= "key",
-	.fops		= &key_fops,
-};
-
-static int key_probe(struct platform_device * pdev)
-{
-	int err;
-
-	err = key_dev_init(&key_dev);
-	if (err != 0) {
-		pr_err("key_dev_init fail\n");
-	}
-
-	err = misc_register(&key_miscdev);
-	if (err < 0) {
-		pr_err("[KEY] error: cannot register device\n");
-		return err;
-	}
-
-	// 初始化定时器 用于按键消抖
-	init_key_timer();
-
-	err = key_irq_init(&key_dev);
+	/* 注册中断（双边沿触发，devm_ 自动释放） */
+	err = devm_request_irq(&pdev->dev, irq, key_irq_handler,
+			       IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING,
+			       "key", dev);
 	if (err) {
-		pr_err("key_irq_init fail\n");
+		dev_err(&pdev->dev, "failed to request irq %d: %d\n", irq, err);
 		return err;
 	}
 
+	/* 注册 misc 设备 */
+	dev->miscdev.minor = MISC_DYNAMIC_MINOR;
+	dev->miscdev.name  = "key";
+	dev->miscdev.fops  = &key_fops;
+
+	err = misc_register(&dev->miscdev);
+	if (err) {
+		dev_err(&pdev->dev, "failed to register misc device: %d\n", err);
+		return err;
+	}
+
+	platform_set_drvdata(pdev, dev);
+	dev_info(&pdev->dev, "key probe ok, irq=%d\n", irq);
 	return 0;
 }
 
 static int key_remove(struct platform_device *pdev)
 {
-	// 注销misc设备驱动
-	(void)misc_deregister(&key_miscdev);
-	free_irq(key_dev.irq.irqnum, &key_dev);
+	struct key_dev *dev = platform_get_drvdata(pdev);
+
+	misc_deregister(&dev->miscdev);
+	del_timer_sync(&dev->timer);  /* 等待定时器完成后再释放 */
 	return 0;
 }
 
-static const struct of_device_id key_of_match_table[] = {
-	{ .compatible = "key" },
-	{},
+static const struct of_device_id key_of_match[] = {
+	{ .compatible = "alientek,key" },
+	{ }
 };
+MODULE_DEVICE_TABLE(of, key_of_match);
 
-static struct platform_driver key_drv = {
-	.probe = key_probe,
+static struct platform_driver key_driver = {
+	.probe  = key_probe,
 	.remove = key_remove,
 	.driver = {
-		.owner = THIS_MODULE,
-		.name = "key",
-		.of_match_table = key_of_match_table,
-	}
+		.name           = "key",
+		.of_match_table = key_of_match,
+	},
 };
 
-static int __init mykey_init(void)
-{
-	return platform_driver_register(&key_drv);
-}
+module_platform_driver(key_driver);
 
-static void __exit mykey_exit(void)
-{
-	platform_driver_unregister(&key_drv);
-}
-
-module_init(mykey_init);
-module_exit(mykey_exit);
 MODULE_LICENSE("GPL");
-
+MODULE_AUTHOR("zrc");
+MODULE_DESCRIPTION("iMX6ULL key platform driver (miscdevice + gpiod + debounce)");
